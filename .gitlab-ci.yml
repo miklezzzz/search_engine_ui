@@ -1,0 +1,228 @@
+image: alpine:latest
+
+stages:
+  - build
+  - test
+  - review
+  - release
+  - deploy
+  - cleanup
+
+build:
+  stage: build
+  image: docker:git
+  services:
+    - docker:dind
+  script:
+    - setup_docker
+    - build
+  variables:
+    DOCKER_DRIVER: overlay2
+  only:
+    - branches
+
+test:
+  stage: test
+  script:
+    - test
+  only:
+    - branches
+
+release:
+  stage: release
+  image: docker:git
+  services:
+    - docker:dind
+  script:
+    - setup_docker
+    - release
+  only:
+    - master
+
+deploy:
+  stage: deploy
+  script:
+    - apk add curl
+    - "curl --request POST --form token=$CI_PIPELINE_TRIGGER --form ref=master http://gitlab.z-project.tk/api/v4/projects/miklezzzz%2Fcrawler-deploy/trigger/pipeline"
+  only:
+    - master
+
+review:
+  stage: review
+  script:
+    - install_dependencies
+    - ensure_namespace
+    - install_tiller
+    - deploy
+  variables:
+    host: review-crawler-ui-$CI_COMMIT_REF_SLUG
+    KUBE_NAMESPACE: review-crawler-ui-$CI_COMMIT_REF_SLUG
+  environment:
+    name: review-crawler-ui-$CI_COMMIT_REF_SLUG
+    url: http://review-crawler-ui-$CI_COMMIT_REF_SLUG.z-project.tk
+    on_stop: stop_review
+  only:
+    refs:
+      - branches
+    kubernetes: active
+  except:
+    - master
+
+stop_review:
+  stage: cleanup
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - install_dependencies
+    - delete
+  environment:
+    name: review-crawler-ui-$CI_COMMIT_REF_SLUG
+    action: stop
+  when: manual
+  allow_failure: true
+  only:
+    refs:
+      - branches
+    kubernetes: active
+  except:
+    - master
+
+.auto_devops: &auto_devops |
+  [[ "$TRACE" ]] && set -x
+  export CI_REGISTRY="index.docker.io"
+  export CI_APPLICATION_REPOSITORY=$CI_REGISTRY/$CI_PROJECT_PATH
+  export CI_APPLICATION_TAG=$CI_COMMIT_REF_SLUG
+  export CI_CONTAINER_NAME=ci_job_build_${CI_JOB_ID}
+  export TILLER_NAMESPACE="kube-system"
+
+  function setup_docker() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  }
+
+  function release() {
+
+    echo "Updating docker images ..."
+
+    if [[ -n "$CI_REGISTRY_USER" ]]; then
+      echo "Logging to GitLab Container Registry with CI credentials..."
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      echo ""
+    fi
+    
+    commitid=`git log --format="%H" -n 1 | awk {'print substr($0,0,8)'}`
+    docker pull "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG"
+    tag=$CI_APPLICATION_TAG-$commitid
+    docker tag "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG" "$CI_APPLICATION_REPOSITORY:$tag"
+    docker push "$CI_APPLICATION_REPOSITORY:$tag"
+
+  }
+
+  function test() {
+
+    echo "Testing Dockerfile-based application..."
+    apk update && apk add python py-pip
+    pip install -r requirements.txt -r requirements-test.txt
+    python -m unittest discover -s tests/
+    coverage run -m unittest discover -s tests/
+    coverage report --include ui/ui.py
+
+  }
+
+  function build() {
+
+    echo "Building Dockerfile-based application..."
+    echo `git show --format="%h" HEAD | head -1` > build_info.txt
+    echo `git rev-parse --abbrev-ref HEAD` >> build_info.txt
+    docker build -t "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG" .
+
+    if [[ -n "$CI_REGISTRY_USER" ]]; then
+      echo "Logging to GitLab Container Registry with CI credentials..."
+      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      echo ""
+    fi
+
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG"
+    echo ""
+  }
+
+  function deploy() {
+
+    track="${1-stable}"
+    name="review-crawler-ui-$CI_COMMIT_REF_SLUG"
+
+    if [[ "$track" != "stable" ]]; then
+      name="$name-$track"
+    fi
+
+    echo $name
+
+    echo "Clone deploy repository..."
+    git clone http://gitlab.z-project.tk/$CI_PROJECT_NAMESPACE/crawler-deploy.git
+
+    echo "Download helm dependencies..."
+    helm dep update crawler-deploy/crawler
+
+    echo "Deploy helm release $name to $KUBE_NAMESPACE"
+
+    crawlercommitid=`git ls-remote http://gitlab.z-project.tk/miklezzzz/search-engine-crawler.git master | awk {'print $1'} | awk {'print substr($0,0,8)'}`
+  
+    helm upgrade --install \
+      --wait \
+      --set search-engine-ui.ingress.host="$host" \
+      --set $CI_PROJECT_NAME.image.tag=$CI_APPLICATION_TAG \
+      --set search-engine-crawler.image.tag=master-$crawlercommitid \
+      --namespace="$KUBE_NAMESPACE" \
+      --version="$CI_PIPELINE_ID-$CI_JOB_ID" \
+      "$name" \
+      crawler-deploy/crawler
+  }
+
+  function install_dependencies() {
+
+    apk add -U openssl curl tar gzip bash ca-certificates git
+    wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub
+    wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.23-r3/glibc-2.23-r3.apk
+    apk add glibc-2.23-r3.apk
+    rm glibc-2.23-r3.apk
+
+    curl https://kubernetes-helm.storage.googleapis.com/helm-v2.12.3-linux-amd64.tar.gz | tar zx
+
+    mv linux-amd64/helm /usr/bin/
+    helm version --client
+
+    curl -L -o /usr/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+    chmod +x /usr/bin/kubectl
+    kubectl version --client
+  }
+
+  function ensure_namespace() {
+
+    kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
+  }
+
+  function install_tiller() {
+
+    echo "Checking Tiller..."
+    helm init --upgrade
+    kubectl rollout status -n "$TILLER_NAMESPACE" -w "deployment/tiller-deploy"
+    if ! helm version --debug; then
+      echo "Failed to init Tiller."
+      return 1
+    fi
+    echo ""
+  }
+
+  function delete() {
+    track="${1-stable}"
+    name="review-crawler-ui-$CI_COMMIT_REF_SLUG"
+    helm delete "$name" --purge || true
+    kubectl delete ns "$name"
+  }
+
+before_script:
+  - *auto_devops

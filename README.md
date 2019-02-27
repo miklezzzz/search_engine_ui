@@ -1,4 +1,4 @@
-# Search Engine UI Miklezzzz
+# Search Engine UI
 
 Веб-интерфейс поиска слов и фраз на проиндексированных [ботом](https://github.com/express42/search_engine_crawler) сайтах.
 
